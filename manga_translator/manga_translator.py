@@ -2,6 +2,7 @@ import asyncio
 import base64
 import io
 from multiprocessing import Pool
+import multiprocessing
 
 import cv2
 from aiohttp.web_middlewares import middleware
@@ -71,6 +72,19 @@ from .save import save_result
 
 # Will be overwritten by __main__.py if module is being run directly (with python -m)
 logger = logging.getLogger('manga_translator')
+
+def _set_multiprocessing_start_method():
+    """Set multiprocessing start method to 'spawn' for CUDA compatibility if needed."""
+    try:
+        # Check if CUDA is available
+        if torch.cuda.is_available():
+            multiprocessing.set_start_method('spawn', force=True)
+    except RuntimeError:
+        # Start method already set, this is fine
+        pass
+
+# Set multiprocessing start method early for CUDA compatibility
+_set_multiprocessing_start_method()
 
 
 def set_main_logger(l):
@@ -363,11 +377,15 @@ class MangaTranslator():
     async def _translate(self, ctx: Context) -> Context:
 
         # -- Colorization
+        colorizer_t1 = time.time()
         if ctx.colorizer:
             await self._report_progress('colorizing')
             ctx.img_colorized = await self._run_colorizer(ctx)
         else:
             ctx.img_colorized = ctx.input
+        colorizer_t2 = time.time()
+        logger.info(f"Colorizer time: {colorizer_t2 - colorizer_t1}")
+
 
         # -- Upscaling
         # The default text detector doesn't work very well on smaller images, might want to
@@ -1343,7 +1361,9 @@ class MangaTranslatorGradio(MangaTranslator):
         self.gradio_concurrency = params.get('gradio_concurrency', 1)
         self.params = params
         logger.info(f"device: {self.device}")
-        self.pool = Pool(processes=1)
+        
+        # Multiprocessing start method is set at module level for CUDA compatibility
+        self.pool = Pool(processes=3)
 
         
     def run_in_event_loop(self, coroutine, *args, **kwargs):
@@ -1861,7 +1881,18 @@ class MangaTranslatorGradio(MangaTranslator):
     
     async def transcribe_audio(self, model, file, ctx):
         temperature = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
-        return whisper.transcribe(model, file.name, beam_size=ctx.beam_size, best_of=ctx.best_of, temperature=temperature, language=ctx.src_lang)
+        return whisper.transcribe(
+            model,
+            file.name,
+            beam_size=ctx.beam_size,
+            best_of=ctx.best_of,
+            temperature=temperature,
+            language=ctx.src_lang,
+            detect_disfluencies=True,
+            include_punctuation_in_confidence=True,
+            condition_on_previous_text=False,
+            vad=True
+        )
 
     async def translate_audio(self, audio_file=None, params={}, progress=gr.Progress()):
         ctx = Context(**params)
@@ -1925,29 +1956,46 @@ class MangaTranslatorGradio(MangaTranslator):
         return translated_sentences
 
     async def _translate(self, ctx: Context) -> Context:
+        # resize image to 1080 height with dynamic width
+        width = int(ctx.input.width * (1080 / ctx.input.height))
+        ctx.input = ctx.input.resize((width, 1080))
+
         # -- Colorization
+        colorizer_t1 = time.time()
         if ctx.colorizer:
             await self._report_progress('colorizing')
             ctx.img_colorized = await self._run_colorizer(ctx)
         else:
             ctx.img_colorized = ctx.input
+        colorizer_t2 = time.time()
+        logger.info(f"Colorizer time: {colorizer_t2 - colorizer_t1}")
+
 
         # -- Upscaling
         # The default text detector doesn't work very well on smaller images, might want to
         # consider adding automatic upscaling on certain kinds of small images.
+        upscaling_t1 = time.time()
         if ctx.upscale_ratio:
             await self._report_progress('upscaling')
             ctx.upscaled = await self._run_upscaling(ctx)
         else:
             ctx.upscaled = ctx.img_colorized
+        upscaling_t2 = time.time()
+        logger.info(f"Upscaling time: {upscaling_t2 - upscaling_t1}")
 
+        load_image_t1 = time.time()
         ctx.img_rgb, ctx.img_alpha = load_image(ctx.upscaled)
+        load_image_t2 = time.time()
+        logger.info(f"Load image time: {load_image_t2 - load_image_t1}")
 
         # -- Detection
+        detection_t1 = time.time()
         await self._report_progress('detection')
         # future = self.pool.apply_async(run_detection_sync, (ctx,))
         # ctx.textlines, ctx.mask_raw, ctx.mask = future.get()
         ctx.textlines, ctx.mask_raw, ctx.mask = await self._run_detection(ctx)
+        detection_t2 = time.time()
+        logger.info(f"Detection time: {detection_t2 - detection_t1}")
         if self.verbose:
             cv2.imwrite(self._result_path('mask_raw.png'), ctx.mask_raw)
 
@@ -1964,8 +2012,11 @@ class MangaTranslatorGradio(MangaTranslator):
 
         # -- OCR
         await self._report_progress('ocr')
+        ocr_t1 = time.time()
         future = self.pool.apply_async(run_ocr_sync, (ctx,))
         ctx.textlines = future.get()
+        ocr_t2 = time.time()
+        logger.info(f"OCR time: {ocr_t2 - ocr_t1}")
         # ctx.textlines = await self._run_ocr(ctx)
         if not ctx.textlines:
             await self._report_progress('skip-no-text', True)
@@ -1975,9 +2026,12 @@ class MangaTranslatorGradio(MangaTranslator):
 
         # -- Textline merge
         await self._report_progress('textline_merge')
+        textline_merge_t1 = time.time()
         # future = executor.submit(self.run_in_event_loop, self._run_textline_merge, ctx)
         # ctx.text_regions = future.result()
         ctx.text_regions = await self._run_textline_merge(ctx)
+        textline_merge_t2 = time.time()
+        logger.info(f"Textline merge time: {textline_merge_t2 - textline_merge_t1}")
 
         if self.verbose:
             bboxes = visualize_textblocks(cv2.cvtColor(ctx.img_rgb, cv2.COLOR_BGR2RGB), ctx.text_regions)
@@ -1987,7 +2041,10 @@ class MangaTranslatorGradio(MangaTranslator):
         await self._report_progress('translating')
         # future = executor.submit(self.run_in_event_loop, self._run_text_translation, ctx)
         # ctx.text_regions = future.result()
+        translation_t1 = time.time()
         ctx.text_regions = await self._run_text_translation(ctx)
+        translation_t2 = time.time()
+        logger.info(f"Translation time: {translation_t2 - translation_t1}")
         await self._report_progress('after-translating')
 
 
@@ -2002,9 +2059,12 @@ class MangaTranslatorGradio(MangaTranslator):
 
         # -- Mask refinement
         # (Delayed to take advantage of the region filtering done after ocr and translation)
+        mask_refinement_t1 = time.time()
         if ctx.mask is None:
             await self._report_progress('mask-generation')
             ctx.mask = await self._run_mask_refinement(ctx)
+        mask_refinement_t2 = time.time()
+        logger.info(f"Mask refinement time: {mask_refinement_t2 - mask_refinement_t1}")
 
         if self.verbose:
             inpaint_input_img = await dispatch_inpainting('none', ctx.img_rgb, ctx.mask, ctx.inpainting_size,
@@ -2016,7 +2076,10 @@ class MangaTranslatorGradio(MangaTranslator):
         await self._report_progress('inpainting')
         # future = executor.submit(self.run_in_event_loop, self._run_inpainting, ctx)
         # ctx.img_inpainted = future.result()
+        inpainting_t1 = time.time()
         ctx.img_inpainted = await self._run_inpainting(ctx)
+        inpainting_t2 = time.time()
+        logger.info(f"Inpainting time: {inpainting_t2 - inpainting_t1}")
 
         ctx.gimp_mask = np.dstack((cv2.cvtColor(ctx.img_inpainted, cv2.COLOR_RGB2BGR), ctx.mask))
 
@@ -2025,7 +2088,10 @@ class MangaTranslatorGradio(MangaTranslator):
 
         # -- Rendering
         await self._report_progress('rendering')
+        rendering_t1 = time.time()
         ctx.img_rendered = await self._run_text_rendering(ctx)
+        rendering_t2 = time.time()
+        logger.info(f"Rendering time: {rendering_t2 - rendering_t1}")
 
         await self._report_progress('finished', True)
         ctx.result = dump_image(ctx.input, ctx.img_rendered, ctx.img_alpha)
@@ -2419,6 +2485,12 @@ async def run_ocr(ctx: Context):
 
 
 def run_ocr_sync(ctx):
-    loop = asyncio.get_event_loop()
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        # No event loop in this thread, create a new one
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    
     result = loop.run_until_complete(run_ocr(ctx))
     return result
