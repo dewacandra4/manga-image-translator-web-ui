@@ -1,6 +1,8 @@
 import asyncio
 import base64
 import io
+from multiprocessing import Pool
+import multiprocessing
 
 import cv2
 from aiohttp.web_middlewares import middleware
@@ -70,6 +72,19 @@ from .save import save_result
 
 # Will be overwritten by __main__.py if module is being run directly (with python -m)
 logger = logging.getLogger('manga_translator')
+
+def _set_multiprocessing_start_method():
+    """Set multiprocessing start method to 'spawn' for CUDA compatibility if needed."""
+    try:
+        # Check if CUDA is available
+        if torch.cuda.is_available():
+            multiprocessing.set_start_method('spawn', force=True)
+    except RuntimeError:
+        # Start method already set, this is fine
+        pass
+
+# Set multiprocessing start method early for CUDA compatibility
+_set_multiprocessing_start_method()
 
 
 def set_main_logger(l):
@@ -362,11 +377,15 @@ class MangaTranslator():
     async def _translate(self, ctx: Context) -> Context:
 
         # -- Colorization
+        colorizer_t1 = time.time()
         if ctx.colorizer:
             await self._report_progress('colorizing')
             ctx.img_colorized = await self._run_colorizer(ctx)
         else:
             ctx.img_colorized = ctx.input
+        colorizer_t2 = time.time()
+        logger.info(f"Colorizer time: {colorizer_t2 - colorizer_t1}")
+
 
         # -- Upscaling
         # The default text detector doesn't work very well on smaller images, might want to
@@ -1343,6 +1362,10 @@ class MangaTranslatorGradio(MangaTranslator):
         self.params = params
         logger.info(f"device: {self.device}")
         
+        # Multiprocessing start method is set at module level for CUDA compatibility
+        self.pool = Pool(processes=3)
+
+        
     def run_in_event_loop(self, coroutine, *args, **kwargs):
         """This function runs the given coroutine in a new event loop."""
         loop = asyncio.new_event_loop()
@@ -1371,13 +1394,15 @@ class MangaTranslatorGradio(MangaTranslator):
             return str
        
     async def process_zip_file(self, zip_file, translator_params=None, progress=gr.Progress()):
-        self.fixBadZipfile(zip_file.name)
+        # self.fixBadZipfile(zip_file.name)
+        # print("zip path: ", zip_file.name)
         # self.validateZipFile(zip_file.name)
         zip_file_name = os.path.splitext(os.path.basename(zip_file.name))[0].strip()
         output_text = ""
         output_files = []
         params_hash = translator_params.get('params_hash', '')
         threads = translator_params.get('threads', 1)
+
         try:
             with zipfile.ZipFile(zip_file.name, "r") as zf:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
@@ -1421,7 +1446,7 @@ class MangaTranslatorGradio(MangaTranslator):
                     for future in progress.tqdm(futures, desc="Processing Files", unit="files"):
                         out_file_name = future.result()
                         if not os.path.exists(out_file_name):
-                            out_file_name = out_file_name.replace(f"-{params_hash}-translated", "")
+                            out_file_name = out_file_name.replace(f"-{params_hash}-translated." + translator_params.get('format', 'jpg'), "")
                         output_files.append({"name":out_file_name, "data": None})
             
             # Create a new zip file
@@ -1680,6 +1705,7 @@ class MangaTranslatorGradio(MangaTranslator):
         except Exception as e:
             dest = None
             status = "Failed to translate zip file:\n" + str(e)
+            raise e
             
         return dest, status
         
@@ -1855,7 +1881,18 @@ class MangaTranslatorGradio(MangaTranslator):
     
     async def transcribe_audio(self, model, file, ctx):
         temperature = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
-        return whisper.transcribe(model, file.name, beam_size=ctx.beam_size, best_of=ctx.best_of, temperature=temperature, language=ctx.src_lang)
+        return whisper.transcribe(
+            model,
+            file.name,
+            beam_size=ctx.beam_size,
+            best_of=ctx.best_of,
+            temperature=temperature,
+            language=ctx.src_lang,
+            detect_disfluencies=True,
+            include_punctuation_in_confidence=True,
+            condition_on_previous_text=False,
+            vad=True
+        )
 
     async def translate_audio(self, audio_file=None, params={}, progress=gr.Progress()):
         ctx = Context(**params)
@@ -1879,16 +1916,17 @@ class MangaTranslatorGradio(MangaTranslator):
             transcribed_audio = await future 
 
         results = None
-        for future in progress.tqdm([self.audio_translate_text(transcribed_audio, 0, ctx)], desc="Translating audio", unit="steps"):
-            results = await future
+        # for future in progress.tqdm([self.audio_translate_text(transcribed_audio, 0, ctx)], desc="Translating audio", unit="steps"):
+        #     results = await future
+        results = await self.audio_translate_text(transcribed_audio, 0, ctx, progress)
         return results
 
 
 
 
-    async def audio_translate_text(self, segments, start_offset, ctx):
+    async def audio_translate_text(self, segments, start_offset, ctx, progress):
             srt_body = []
-            translated_sentences = await self.run_text_translation(segments, ctx)
+            translated_sentences = await self.run_text_translation(segments, ctx, progress)
             for i, segment in enumerate(segments["segments"]):
                 start_time = self.convert_to_srt_time(segment["start"] + start_offset)
                 end_time = self.convert_to_srt_time(segment["end"] + start_offset)
@@ -1909,21 +1947,204 @@ class MangaTranslatorGradio(MangaTranslator):
         srt_time = f"{int(h):02d}:{int(m):02d}:{int(s):02d},{ms:03d}"
         return srt_time
 
-    async def run_text_translation(self, segments, ctx):
-        return await dispatch_translation(ctx.translator, [segment["text"] for segment in segments["segments"]], ctx.use_mtpe, ctx,
+    async def run_text_translation(self, segments, ctx, progress):
+        translated_sentences = []
+        for segment in progress.tqdm(segments["segments"], desc="Translating segments", unit="segment"):
+            translated = await dispatch_translation(ctx.translator, [segment["text"]], ctx.use_mtpe, ctx,
                                            'cpu' if self._gpu_limited_memory else self.device)
+            translated_sentences.extend(translated)
+        return translated_sentences
+
+    async def _translate(self, ctx: Context) -> Context:
+        # resize image to 1080 height with dynamic width
+        width = int(ctx.input.width * (1080 / ctx.input.height))
+        ctx.input = ctx.input.resize((width, 1080))
+
+        # -- Colorization
+        colorizer_t1 = time.time()
+        if ctx.colorizer:
+            await self._report_progress('colorizing')
+            ctx.img_colorized = await self._run_colorizer(ctx)
+        else:
+            ctx.img_colorized = ctx.input
+        colorizer_t2 = time.time()
+        logger.info(f"Colorizer time: {colorizer_t2 - colorizer_t1}")
+
+
+        # -- Upscaling
+        # The default text detector doesn't work very well on smaller images, might want to
+        # consider adding automatic upscaling on certain kinds of small images.
+        upscaling_t1 = time.time()
+        if ctx.upscale_ratio:
+            await self._report_progress('upscaling')
+            ctx.upscaled = await self._run_upscaling(ctx)
+        else:
+            ctx.upscaled = ctx.img_colorized
+        upscaling_t2 = time.time()
+        logger.info(f"Upscaling time: {upscaling_t2 - upscaling_t1}")
+
+        load_image_t1 = time.time()
+        ctx.img_rgb, ctx.img_alpha = load_image(ctx.upscaled)
+        load_image_t2 = time.time()
+        logger.info(f"Load image time: {load_image_t2 - load_image_t1}")
+
+        # -- Detection
+        detection_t1 = time.time()
+        await self._report_progress('detection')
+        # future = self.pool.apply_async(run_detection_sync, (ctx,))
+        # ctx.textlines, ctx.mask_raw, ctx.mask = future.get()
+        ctx.textlines, ctx.mask_raw, ctx.mask = await self._run_detection(ctx)
+        detection_t2 = time.time()
+        logger.info(f"Detection time: {detection_t2 - detection_t1}")
+        if self.verbose:
+            cv2.imwrite(self._result_path('mask_raw.png'), ctx.mask_raw)
+
+        if not ctx.textlines:
+            await self._report_progress('skip-no-regions', True)
+            # If no text was found result is intermediate image product
+            ctx.result = ctx.upscaled
+            return ctx
+        if self.verbose:
+            img_bbox_raw = np.copy(ctx.img_rgb)
+            for txtln in ctx.textlines:
+                cv2.polylines(img_bbox_raw, [txtln.pts], True, color=(255, 0, 0), thickness=2)
+            cv2.imwrite(self._result_path('bboxes_unfiltered.png'), cv2.cvtColor(img_bbox_raw, cv2.COLOR_RGB2BGR))
+
+        # -- OCR
+        await self._report_progress('ocr')
+        ocr_t1 = time.time()
+        future = self.pool.apply_async(run_ocr_sync, (ctx,))
+        ctx.textlines = future.get()
+        ocr_t2 = time.time()
+        logger.info(f"OCR time: {ocr_t2 - ocr_t1}")
+        # ctx.textlines = await self._run_ocr(ctx)
+        if not ctx.textlines:
+            await self._report_progress('skip-no-text', True)
+            # If no text was found result is intermediate image product
+            ctx.result = ctx.upscaled
+            return ctx
+
+        # -- Textline merge
+        await self._report_progress('textline_merge')
+        textline_merge_t1 = time.time()
+        # future = executor.submit(self.run_in_event_loop, self._run_textline_merge, ctx)
+        # ctx.text_regions = future.result()
+        ctx.text_regions = await self._run_textline_merge(ctx)
+        textline_merge_t2 = time.time()
+        logger.info(f"Textline merge time: {textline_merge_t2 - textline_merge_t1}")
+
+        if self.verbose:
+            bboxes = visualize_textblocks(cv2.cvtColor(ctx.img_rgb, cv2.COLOR_BGR2RGB), ctx.text_regions)
+            cv2.imwrite(self._result_path('bboxes.png'), bboxes)
+
+        # -- Translation
+        await self._report_progress('translating')
+        # future = executor.submit(self.run_in_event_loop, self._run_text_translation, ctx)
+        # ctx.text_regions = future.result()
+        translation_t1 = time.time()
+        ctx.text_regions = await self._run_text_translation(ctx)
+        translation_t2 = time.time()
+        logger.info(f"Translation time: {translation_t2 - translation_t1}")
+        await self._report_progress('after-translating')
+
+
+        if not ctx.text_regions:
+            await self._report_progress('error-translating', True)
+            ctx.result = ctx.upscaled
+            return ctx
+        elif ctx.text_regions == 'cancel':
+            await self._report_progress('cancelled', True)
+            ctx.result = ctx.upscaled
+            return ctx
+
+        # -- Mask refinement
+        # (Delayed to take advantage of the region filtering done after ocr and translation)
+        mask_refinement_t1 = time.time()
+        if ctx.mask is None:
+            await self._report_progress('mask-generation')
+            ctx.mask = await self._run_mask_refinement(ctx)
+        mask_refinement_t2 = time.time()
+        logger.info(f"Mask refinement time: {mask_refinement_t2 - mask_refinement_t1}")
+
+        if self.verbose:
+            inpaint_input_img = await dispatch_inpainting('none', ctx.img_rgb, ctx.mask, ctx.inpainting_size,
+                                                          self.using_gpu, self.verbose)
+            cv2.imwrite(self._result_path('inpaint_input.png'), cv2.cvtColor(inpaint_input_img, cv2.COLOR_RGB2BGR))
+            cv2.imwrite(self._result_path('mask_final.png'), ctx.mask)
+
+        # -- Inpainting
+        await self._report_progress('inpainting')
+        # future = executor.submit(self.run_in_event_loop, self._run_inpainting, ctx)
+        # ctx.img_inpainted = future.result()
+        inpainting_t1 = time.time()
+        ctx.img_inpainted = await self._run_inpainting(ctx)
+        inpainting_t2 = time.time()
+        logger.info(f"Inpainting time: {inpainting_t2 - inpainting_t1}")
+
+        ctx.gimp_mask = np.dstack((cv2.cvtColor(ctx.img_inpainted, cv2.COLOR_RGB2BGR), ctx.mask))
+
+        if self.verbose:
+            cv2.imwrite(self._result_path('inpainted.png'), cv2.cvtColor(ctx.img_inpainted, cv2.COLOR_RGB2BGR))
+
+        # -- Rendering
+        await self._report_progress('rendering')
+        rendering_t1 = time.time()
+        ctx.img_rendered = await self._run_text_rendering(ctx)
+        rendering_t2 = time.time()
+        logger.info(f"Rendering time: {rendering_t2 - rendering_t1}")
+
+        await self._report_progress('finished', True)
+        ctx.result = dump_image(ctx.input, ctx.img_rendered, ctx.img_alpha)
+
+        if ctx.revert_upscaling:
+            await self._report_progress('downscaling')
+            ctx.result = ctx.result.resize(ctx.input.size)
+
+        return ctx
         
         
         
-    def fixBadZipfile(self, zipFile):  
-        f = open(zipFile, 'r+b')  
-        data = f.read()  
-        pos = data.find(b'\x50\x4b\x05\x06') # End of central directory signature  
-        if (pos > 0):  
-            # print("Trancating file at location " + str(pos + 22)+ ".")  
-            f.seek(pos + 22)   # size of 'ZIP end of central directory record' 
-            f.truncate()  
-            f.close()
+    def fixBadZipfile(self, zipFile):
+        """Fix a corrupted zip file by finding and correcting the central directory signature."""
+        with open(zipFile, 'r+b') as f:
+            data = f.read()
+            pos = data.find(b'\x50\x4b\x05\x06')  # End of central directory signature
+            if pos > 0:
+                # Check if there's any data after the signature
+                if pos + 22 > len(data):
+                    # The directory length is too short, try to find an alternative signature
+                    pos = data.rfind(b'\x50\x4b\x05\x06', 0, pos)
+                
+                if pos > 0:
+                    f.seek(pos + 22)   # size of 'ZIP end of central directory record'
+                    f.truncate()
+                    f.close()
+                    return
+                    
+            # If we couldn't find a valid signature, try an alternative approach
+            pos = data.find(b'\x50\x4b\x01\x02')  # Central directory file header signature
+            if pos > 0:
+                # Scan backwards for the end of central directory signature
+                pos = data.rfind(b'\x50\x4b\x05\x06', 0, pos + 1000)  # Look within reasonable range
+                if pos > 0:
+                    f.seek(pos + 22)
+                    f.truncate()
+                    f.close()
+                    return
+                    
+            # If all else fails, try to find the last valid file entry
+            pos = data.rfind(b'\x50\x4b\x03\x04')  # Local file header signature
+            if pos > 0:
+                f.seek(pos)
+                # Read the file name length
+                f.seek(pos + 26)
+                name_length = int.from_bytes(f.read(2), 'little')
+                extra_length = int.from_bytes(f.read(2), 'little')
+                # Skip to the end of this file entry
+                f.seek(pos + 30 + name_length + extra_length)
+                f.truncate()
+                f.close()
+                return
         
     def validateZipFile(self, zipFile):
         with zipfile.ZipFile(zipFile, "r") as zf:
@@ -1968,7 +2189,8 @@ class MangaTranslatorGradio(MangaTranslator):
         colorizer_list = ['None']
         colorizer_list.extend(COLORIZERS.keys())
         device_selected = [self.device]
-        image_detection_size_list = ['1024', '1536', '2048', '2560', '3072', '3584', '4096']
+        image_detection_size_list = ['1024', '1536', '2048', '2560', '3072', '3584', '4096', '4608', '5120', '5632', '6144', '6656', '7168', '7680', '8192']
+
         
         with gr.Blocks() as interface:
             gr.Markdown("Manga Image Translator And Audio Transcriber")
@@ -2000,7 +2222,7 @@ class MangaTranslatorGradio(MangaTranslator):
                         translator_gpt_config = gr.File(label="GPT Config (Optional for GPT Translator)", type="filepath")
                         translator_target_lang = gr.Dropdown(list(VALID_LANGUAGES.keys()), label="Target Language", value="ENG")
                         translator_device = gr.Radio(list(device_selected), label="Device", value=self.device)
-                        translator_threads = gr.Slider(minimum=1, maximum=10, step=1, label="Threads", value=1)
+                        translator_threads = gr.Slider(minimum=1, maximum=4, step=1, label="Threads", value=1)
                             
                 with gr.Column():
                     gr.Markdown("Image Settings")
@@ -2094,7 +2316,7 @@ class MangaTranslatorGradio(MangaTranslator):
                             audio_file_output_type = gr.Dropdown(["txt", "srt"], label="Output File Type", value="txt")
                         gr.Markdown("Audio Detection Settings")
                         with gr.Row():
-                            audio_model = gr.Dropdown(["tiny", "base", "small", "medium", "large"], label="Model", value="base")
+                            audio_model = gr.Dropdown(["tiny", "base", "small", "medium", "large", "large-v3", "turbo"], label="Model", value="base")
                             audio_beam_size = gr.Slider(minimum=1, maximum=20, step=1, label="Beam Size", value=5)
                             audio_best_of = gr.Slider(minimum=1, maximum=20, step=1, label="Best Of", value=5)
                         
@@ -2187,7 +2409,7 @@ class MangaTranslatorGradio(MangaTranslator):
         
         
     async def start(self):
-        image_detection_size_list = ['1024', '1536', '2048', '2560', '3072', '3584', '4096']
+        image_detection_size_list = ['1024', '1536', '2048', '2560', '3072', '3584', '4096', '4608', '5120', '5632', '6144', '6656', '7168', '7680', '8192']
         with gr.Blocks() as interface:
             gr.Markdown("Manga Image Translator")
             with gr.Tab("Single"):
@@ -2246,3 +2468,29 @@ class MangaTranslatorGradio(MangaTranslator):
                 concurrency_limit=self.gradio_concurrency)
         
         interface.queue(default_concurrency_limit=2).launch(server_name=self.host, debug=True, share=self.share, server_port=self.port)
+
+
+async def run_ocr(ctx: Context):
+        textlines = await dispatch_ocr(ctx.ocr, ctx.img_rgb, ctx.textlines, ctx, 'cuda', False)
+
+        new_textlines = []
+        for textline in textlines:
+            if textline.text.strip():
+                if ctx.font_color_fg:
+                    textline.fg_r, textline.fg_g, textline.fg_b = ctx.font_color_fg
+                if ctx.font_color_bg:
+                    textline.bg_r, textline.bg_g, textline.bg_b = ctx.font_color_bg
+                new_textlines.append(textline)
+        return new_textlines
+
+
+def run_ocr_sync(ctx):
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        # No event loop in this thread, create a new one
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    
+    result = loop.run_until_complete(run_ocr(ctx))
+    return result
