@@ -91,7 +91,7 @@ DEFAULT_TRANSLATION_PARAMS = {}
 AVAILABLE_TRANSLATORS = []
 FORMAT = ''
 
-app = web.Application(client_max_size = 1024 * 1024 * 500)  # 500MB to support large manga ZIPs
+app = web.Application(client_max_size = 1024 * 1024 * 50)  # 50MB limit for manga ZIP uploads
 routes = web.RouteTableDef()
 
 
