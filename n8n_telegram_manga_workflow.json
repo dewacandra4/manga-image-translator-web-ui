@@ -1,0 +1,321 @@
+{
+    "name": "Manga Translator – Telegram Bot",
+    "nodes": [
+        {
+            "parameters": {
+                "updates": [
+                    "message"
+                ],
+                "additionalFields": {}
+            },
+            "id": "telegram-trigger",
+            "name": "Telegram Trigger",
+            "type": "n8n-nodes-base.telegramTrigger",
+            "typeVersion": 1.1,
+            "position": [
+                240,
+                300
+            ],
+            "webhookId": "manga-telegram-trigger",
+            "credentials": {
+                "telegramApi": {
+                    "id": "REPLACE_WITH_YOUR_TELEGRAM_CREDENTIAL_ID",
+                    "name": "Telegram Bot"
+                }
+            }
+        },
+        {
+            "parameters": {
+                "conditions": {
+                    "options": {
+                        "caseSensitive": false,
+                        "leftValue": "",
+                        "typeValidation": "strict"
+                    },
+                    "conditions": [
+                        {
+                            "id": "check-document",
+                            "leftValue": "={{ $json.message.document !== undefined }}",
+                            "rightValue": true,
+                            "operator": {
+                                "type": "boolean",
+                                "operation": "equals"
+                            }
+                        }
+                    ],
+                    "combinator": "and"
+                },
+                "options": {}
+            },
+            "id": "if-has-document",
+            "name": "Has Document?",
+            "type": "n8n-nodes-base.if",
+            "typeVersion": 2,
+            "position": [
+                460,
+                300
+            ]
+        },
+        {
+            "parameters": {
+                "chatId": "={{ $('Telegram Trigger').item.json.message.chat.id }}",
+                "text": "❌ Please send a .zip file containing your manga pages.",
+                "additionalFields": {}
+            },
+            "id": "telegram-error-no-file",
+            "name": "Reply: No File",
+            "type": "n8n-nodes-base.telegram",
+            "typeVersion": 1.2,
+            "position": [
+                680,
+                480
+            ],
+            "credentials": {
+                "telegramApi": {
+                    "id": "REPLACE_WITH_YOUR_TELEGRAM_CREDENTIAL_ID",
+                    "name": "Telegram Bot"
+                }
+            }
+        },
+        {
+            "parameters": {
+                "chatId": "={{ $('Telegram Trigger').item.json.message.chat.id }}",
+                "text": "📥 Got your manga! Translation started...\n\n📄 Pages queued: will process one by one.\n⏳ This may take a while depending on the manga size. I'll send the translated ZIP when done!",
+                "additionalFields": {}
+            },
+            "id": "telegram-ack",
+            "name": "Reply: Acknowledge",
+            "type": "n8n-nodes-base.telegram",
+            "typeVersion": 1.2,
+            "position": [
+                680,
+                300
+            ],
+            "credentials": {
+                "telegramApi": {
+                    "id": "REPLACE_WITH_YOUR_TELEGRAM_CREDENTIAL_ID",
+                    "name": "Telegram Bot"
+                }
+            }
+        },
+        {
+            "parameters": {
+                "url": "=https://api.telegram.org/bot{{ $env.TELEGRAM_BOT_TOKEN }}/getFile?file_id={{ $('Telegram Trigger').item.json.message.document.file_id }}",
+                "options": {}
+            },
+            "id": "get-file-path",
+            "name": "Get Telegram File Path",
+            "type": "n8n-nodes-base.httpRequest",
+            "typeVersion": 4.2,
+            "position": [
+                900,
+                300
+            ]
+        },
+        {
+            "parameters": {
+                "url": "=https://api.telegram.org/file/bot{{ $env.TELEGRAM_BOT_TOKEN }}/{{ $json.result.file_path }}",
+                "options": {
+                    "response": {
+                        "response": {
+                            "responseFormat": "file"
+                        }
+                    }
+                }
+            },
+            "id": "download-zip",
+            "name": "Download ZIP from Telegram",
+            "type": "n8n-nodes-base.httpRequest",
+            "typeVersion": 4.2,
+            "position": [
+                1120,
+                300
+            ]
+        },
+        {
+            "parameters": {
+                "url": "=http://localhost:5003/batch-zip",
+                "method": "POST",
+                "sendBody": true,
+                "contentType": "multipart-form-data",
+                "bodyParameters": {
+                    "parameters": [
+                        {
+                            "name": "file",
+                            "value": "={{ $binary.data }}",
+                            "parameterType": "formBinaryData",
+                            "inputDataFieldName": "data"
+                        },
+                        {
+                            "name": "target_lang",
+                            "value": "ENG"
+                        },
+                        {
+                            "name": "translator",
+                            "value": "sugoi"
+                        },
+                        {
+                            "name": "size",
+                            "value": "M"
+                        }
+                    ]
+                },
+                "options": {
+                    "response": {
+                        "response": {
+                            "responseFormat": "file",
+                            "outputPropertyName": "translatedZip"
+                        }
+                    },
+                    "timeout": 7200000
+                }
+            },
+            "id": "translate-batch",
+            "name": "POST to /batch-zip",
+            "type": "n8n-nodes-base.httpRequest",
+            "typeVersion": 4.2,
+            "position": [
+                1340,
+                300
+            ],
+            "notes": "Timeout set to 2 hours (7200000ms) for large manga volumes. Adjust target_lang and translator as needed."
+        },
+        {
+            "parameters": {
+                "chatId": "={{ $('Telegram Trigger').item.json.message.chat.id }}",
+                "binaryData": true,
+                "binaryPropertyName": "translatedZip",
+                "additionalFields": {
+                    "caption": "✅ Translation complete! Here is your translated manga ZIP."
+                }
+            },
+            "id": "telegram-send-result",
+            "name": "Send Translated ZIP",
+            "type": "n8n-nodes-base.telegram",
+            "typeVersion": 1.2,
+            "position": [
+                1560,
+                300
+            ],
+            "credentials": {
+                "telegramApi": {
+                    "id": "REPLACE_WITH_YOUR_TELEGRAM_CREDENTIAL_ID",
+                    "name": "Telegram Bot"
+                }
+            }
+        },
+        {
+            "parameters": {
+                "chatId": "={{ $('Telegram Trigger').item.json.message.chat.id }}",
+                "text": "=❌ Translation failed. Error: {{ $json.error || 'Unknown error' }}\n\nPlease check that:\n- The ZIP contains valid image files (.jpg, .png, .webp)\n- The translator server is running\n- Images are not too large (max 64MP per page)",
+                "additionalFields": {}
+            },
+            "id": "telegram-error-translation",
+            "name": "Reply: Translation Error",
+            "type": "n8n-nodes-base.telegram",
+            "typeVersion": 1.2,
+            "position": [
+                1560,
+                480
+            ],
+            "credentials": {
+                "telegramApi": {
+                    "id": "REPLACE_WITH_YOUR_TELEGRAM_CREDENTIAL_ID",
+                    "name": "Telegram Bot"
+                }
+            }
+        }
+    ],
+    "connections": {
+        "Telegram Trigger": {
+            "main": [
+                [
+                    {
+                        "node": "Has Document?",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Has Document?": {
+            "main": [
+                [
+                    {
+                        "node": "Reply: Acknowledge",
+                        "type": "main",
+                        "index": 0
+                    }
+                ],
+                [
+                    {
+                        "node": "Reply: No File",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Reply: Acknowledge": {
+            "main": [
+                [
+                    {
+                        "node": "Get Telegram File Path",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Get Telegram File Path": {
+            "main": [
+                [
+                    {
+                        "node": "Download ZIP from Telegram",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Download ZIP from Telegram": {
+            "main": [
+                [
+                    {
+                        "node": "POST to /batch-zip",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "POST to /batch-zip": {
+            "main": [
+                [
+                    {
+                        "node": "Send Translated ZIP",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        }
+    },
+    "pinData": {},
+    "settings": {
+        "executionOrder": "v1",
+        "saveManualExecutions": true,
+        "callerPolicy": "workflowsFromSameOwner",
+        "errorWorkflow": ""
+    },
+    "staticData": null,
+    "tags": [
+        "manga",
+        "telegram",
+        "translation",
+        "automation"
+    ],
+    "triggerCount": 1,
+    "updatedAt": "2026-02-20T10:00:00.000Z",
+    "versionId": "1"
+}

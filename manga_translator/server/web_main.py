@@ -3,6 +3,7 @@ import os
 import sys
 import re
 import shutil
+import zipfile
 import mimetypes
 import time
 import asyncio
@@ -90,7 +91,7 @@ DEFAULT_TRANSLATION_PARAMS = {}
 AVAILABLE_TRANSLATORS = []
 FORMAT = ''
 
-app = web.Application(client_max_size = 1024 * 1024 * 50)
+app = web.Application(client_max_size = 1024 * 1024 * 500)  # 500MB to support large manga ZIPs
 routes = web.RouteTableDef()
 
 
@@ -247,6 +248,198 @@ async def run_async(request):
         if state['finished']:
             break
     return web.json_response({'task_id': task_id, 'status': 'successful' if state['finished'] else state['info']})
+
+
+@routes.post("/batch-zip")
+async def batch_zip_async(request):
+    """
+    Accepts a ZIP file containing manga images, translates each page using the
+    existing task queue, then returns a new ZIP with translated images.
+
+    Form fields:
+        file        - required, the .zip file upload
+        target_lang - optional, target language code (default: ENG)
+        translator  - optional, translator name (default: first available)
+        size        - optional, S/M/L/X detection size (default: M)
+        detector    - optional, detector name (default: default)
+        direction   - optional, text direction auto/h/v (default: auto)
+    """
+    global FORMAT, AVAILABLE_TRANSLATORS
+
+    # ------------------------------------------------------------------ #
+    # 1. Parse request parameters
+    # ------------------------------------------------------------------ #
+    try:
+        data = await request.post()
+    except Exception as e:
+        return web.json_response({'status': 'error', 'error': f'Failed to parse request: {e}'})
+
+    # Translation params (mirrors handle_post logic)
+    target_language = 'ENG'
+    selected_translator = AVAILABLE_TRANSLATORS[0] if AVAILABLE_TRANSLATORS else 'sugoi'
+    detection_size = 1536  # M by default
+    detector = 'default'
+    direction = 'auto'
+
+    if 'target_lang' in data:
+        lang = data['target_lang'].upper()
+        if lang in VALID_LANGUAGES:
+            target_language = lang
+
+    if 'translator' in data:
+        t = data['translator'].lower()
+        if t in AVAILABLE_TRANSLATORS:
+            selected_translator = t
+
+    if 'size' in data:
+        size_text = data['size'].upper()
+        size_map = {'S': 1024, 'M': 1536, 'L': 2048, 'X': 2560}
+        detection_size = size_map.get(size_text, 1536)
+
+    if 'detector' in data:
+        d = data['detector'].lower()
+        if d in VALID_DETECTORS:
+            detector = d
+
+    if 'direction' in data:
+        dr = data['direction'].lower()
+        if dr in VALID_DIRECTIONS:
+            direction = dr
+
+    # ------------------------------------------------------------------ #
+    # 2. Read and validate the uploaded ZIP
+    # ------------------------------------------------------------------ #
+    if 'file' not in data:
+        return web.json_response({'status': 'error', 'error': 'No file field in request'})
+
+    zip_content = data['file'].file.read()
+
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(zip_content))
+    except zipfile.BadZipFile:
+        return web.json_response({'status': 'error', 'error': 'Uploaded file is not a valid ZIP'})
+
+    # Collect valid image entries from the ZIP (skip dirs, hidden files, non-images)
+    SUPPORTED_EXTS = {'.png', '.jpg', '.jpeg', '.webp', '.bmp'}
+    image_entries = [
+        name for name in zf.namelist()
+        if not name.endswith('/') and
+        not os.path.basename(name).startswith('.') and
+        os.path.splitext(name.lower())[1] in SUPPORTED_EXTS
+    ]
+
+    if not image_entries:
+        return web.json_response({'status': 'error', 'error': 'No supported image files found in ZIP'})
+
+    print(f'[batch-zip] Processing {len(image_entries)} images: target={target_language}, translator={selected_translator}')
+
+    # ------------------------------------------------------------------ #
+    # 3. Queue each image as an individual translation task
+    # ------------------------------------------------------------------ #
+    task_ids = []      # ordered list of (original_name, task_id)
+    now = time.time()
+
+    for entry_name in image_entries:
+        try:
+            img_bytes = zf.read(entry_name)
+            img = Image.open(io.BytesIO(img_bytes))
+            img.verify()
+            img = Image.open(io.BytesIO(img_bytes))
+        except Exception as e:
+            print(f'[batch-zip] Skipping {entry_name}: {e}')
+            task_ids.append((entry_name, None))  # mark as failed
+            continue
+
+        if img.width * img.height > MAX_IMAGE_SIZE_PX:
+            print(f'[batch-zip] Skipping {entry_name}: image too large')
+            task_ids.append((entry_name, None))
+            continue
+
+        task_id = f'{phash(img, hash_size=16)}-{detection_size}-{selected_translator}-{target_language}-{detector}-{direction}'
+
+        if not os.path.exists(f'result/{task_id}/final.{FORMAT}'):
+            os.makedirs(f'result/{task_id}/', exist_ok=True)
+            img.save(f'result/{task_id}/input.png')
+
+            if task_id not in TASK_DATA:
+                QUEUE.append(task_id)
+                TASK_DATA[task_id] = {
+                    'detection_size': detection_size,
+                    'translator': selected_translator,
+                    'target_lang': target_language,
+                    'detector': detector,
+                    'direction': direction,
+                    'created_at': now,
+                    'requested_at': now,
+                }
+                TASK_STATES[task_id] = {
+                    'info': 'pending',
+                    'finished': False,
+                }
+
+        task_ids.append((entry_name, task_id))
+        print(f'[batch-zip] Queued task {task_id} for {entry_name}')
+
+    # ------------------------------------------------------------------ #
+    # 4. Wait until all queued tasks are finished
+    # ------------------------------------------------------------------ #
+    pending = {task_id for _, task_id in task_ids if task_id is not None}
+
+    while pending:
+        await asyncio.sleep(0.5)
+        # Refresh requested_at so the cleanup loop doesn't evict our tasks
+        for task_id in list(pending):
+            if task_id in TASK_DATA:
+                TASK_DATA[task_id]['requested_at'] = time.time()
+
+        done = set()
+        for task_id in list(pending):
+            if task_id not in TASK_STATES:
+                # task was removed (e.g., error / evicted)
+                done.add(task_id)
+            elif TASK_STATES[task_id].get('finished', False):
+                done.add(task_id)
+        pending -= done
+
+    print('[batch-zip] All tasks finished, assembling result ZIP')
+
+    # ------------------------------------------------------------------ #
+    # 5. Build the output ZIP in memory
+    # ------------------------------------------------------------------ #
+    out_buffer = io.BytesIO()
+    failed_pages = []
+
+    with zipfile.ZipFile(out_buffer, mode='w', compression=zipfile.ZIP_DEFLATED) as out_zip:
+        for original_name, task_id in task_ids:
+            if task_id is None:
+                failed_pages.append(original_name)
+                continue
+
+            result_path = f'result/{task_id}/final.{FORMAT}'
+            if os.path.exists(result_path):
+                # Preserve the original filename/folder structure inside the ZIP
+                base_name = os.path.splitext(original_name)[0]
+                out_name = f'{base_name}.{FORMAT}'
+                out_zip.write(result_path, arcname=out_name)
+                print(f'[batch-zip] Added {out_name} to result ZIP')
+            else:
+                failed_pages.append(original_name)
+                print(f'[batch-zip] Result missing for {original_name} (task_id={task_id})')
+
+        # If any pages failed, include a summary text file
+        if failed_pages:
+            summary = 'The following pages could not be translated:\n' + '\n'.join(failed_pages)
+            out_zip.writestr('TRANSLATION_ERRORS.txt', summary)
+
+    zip_bytes = out_buffer.getvalue()
+    print(f'[batch-zip] Done. Result ZIP size: {len(zip_bytes)} bytes, failed pages: {len(failed_pages)}')
+
+    return web.Response(
+        body=zip_bytes,
+        status=200,
+        content_type='application/zip',
+        headers={'Content-Disposition': 'attachment; filename="translated.zip"'},
+    )
 
 
 @routes.post("/connect-internal")
