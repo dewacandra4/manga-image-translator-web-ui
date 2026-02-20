@@ -313,6 +313,10 @@ async def batch_zip_async(request):
         return web.json_response({'status': 'error', 'error': 'No file field in request'})
 
     zip_content = data['file'].file.read()
+    original_filename = data['file'].filename or 'translated.zip'
+    # Build output filename: e.g. chapter_5.zip -> chapter_5_translated.zip
+    base_stem = os.path.splitext(original_filename)[0]
+    original_filename = f'{base_stem}_translated.zip'
 
     try:
         zf = zipfile.ZipFile(io.BytesIO(zip_content))
@@ -438,7 +442,7 @@ async def batch_zip_async(request):
         body=zip_bytes,
         status=200,
         content_type='application/zip',
-        headers={'Content-Disposition': 'attachment; filename="translated.zip"'},
+        headers={'Content-Disposition': f'attachment; filename="{original_filename}"'},
     )
 
 
