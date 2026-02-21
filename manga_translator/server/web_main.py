@@ -2,6 +2,7 @@ import io
 import os
 import sys
 import re
+import hashlib
 import shutil
 import zipfile
 import mimetypes
@@ -90,6 +91,11 @@ TASK_STATES = {}
 DEFAULT_TRANSLATION_PARAMS = {}
 AVAILABLE_TRANSLATORS = []
 FORMAT = ''
+
+# ── Async batch-zip job tracking ──────────────────────────────────────────────
+# Keys: job_id (SHA-256 of ZIP content + params)
+# Values: dict with status, progress, result bytes, etc.
+BATCH_JOBS = {}
 
 app = web.Application(client_max_size = 1024 * 1024 * 50)  # 50MB limit for manga ZIP uploads
 routes = web.RouteTableDef()
@@ -253,8 +259,8 @@ async def run_async(request):
 @routes.post("/batch-zip")
 async def batch_zip_async(request):
     """
-    Accepts a ZIP file containing manga images, translates each page using the
-    existing task queue, then returns a new ZIP with translated images.
+    Accepts a ZIP file and starts an async translation job.
+    Returns a job_id immediately — poll /batch-zip-status/{job_id} for progress.
 
     Form fields:
         file        - required, the .zip file upload
@@ -274,7 +280,6 @@ async def batch_zip_async(request):
     except Exception as e:
         return web.json_response({'status': 'error', 'error': f'Failed to parse request: {e}'})
 
-    # Translation params (mirrors handle_post logic)
     target_language = 'ENG'
     selected_translator = AVAILABLE_TRANSLATORS[0] if AVAILABLE_TRANSLATORS else 'sugoi'
     detection_size = 1536  # M by default
@@ -313,36 +318,88 @@ async def batch_zip_async(request):
         return web.json_response({'status': 'error', 'error': 'No file field in request'})
 
     zip_content = data['file'].file.read()
-    original_filename = data['file'].filename or 'translated.zip'
-    # Build output filename: e.g. chapter_5.zip -> chapter_5_translated.zip
+    original_filename = data['file'].filename or 'manga.zip'
     base_stem = os.path.splitext(original_filename)[0]
-    original_filename = f'{base_stem}_translated.zip'
+    output_filename = f'{base_stem}_translated.zip'
 
     try:
         zf = zipfile.ZipFile(io.BytesIO(zip_content))
     except zipfile.BadZipFile:
         return web.json_response({'status': 'error', 'error': 'Uploaded file is not a valid ZIP'})
 
-    # Collect valid image entries from the ZIP (skip dirs, hidden files, non-images)
     SUPPORTED_EXTS = {'.png', '.jpg', '.jpeg', '.webp', '.bmp'}
-    image_entries = [
+    image_entries = sorted([
         name for name in zf.namelist()
         if not name.endswith('/') and
         not os.path.basename(name).startswith('.') and
         os.path.splitext(name.lower())[1] in SUPPORTED_EXTS
-    ]
+    ])
 
     if not image_entries:
         return web.json_response({'status': 'error', 'error': 'No supported image files found in ZIP'})
 
-    print(f'[batch-zip] Processing {len(image_entries)} images: target={target_language}, translator={selected_translator}')
+    # ------------------------------------------------------------------ #
+    # 3. Compute job_id from ZIP content + translation params (for resume)
+    # ------------------------------------------------------------------ #
+    param_str = f'{target_language}-{selected_translator}-{detection_size}-{detector}-{direction}'
+    job_id = hashlib.sha256(zip_content + param_str.encode()).hexdigest()[:24]
+
+    # Deduplicate: if same job already running or done, return existing
+    if job_id in BATCH_JOBS:
+        job = BATCH_JOBS[job_id]
+        return web.json_response({
+            'job_id': job_id,
+            'status': job['status'],
+            'total_pages': job['total'],
+            'done_count': job['done_count'],
+            'message': 'Job already exists — poll /batch-zip-status/{job_id} for progress'
+        })
 
     # ------------------------------------------------------------------ #
-    # 3. Queue each image as an individual translation task
+    # 4. Create job record and start background processing
     # ------------------------------------------------------------------ #
-    task_ids = []      # ordered list of (original_name, task_id)
+    BATCH_JOBS[job_id] = {
+        'status': 'processing',
+        'total': len(image_entries),
+        'done_count': 0,
+        'failed': [],
+        'output_filename': output_filename,
+        'result_zip': None,
+        'created_at': time.time(),
+        'error': None,
+    }
+
+    print(f'[batch-zip] New job {job_id}: {len(image_entries)} pages, params={param_str}')
+
+    # Start background processing (non-blocking)
+    asyncio.ensure_future(
+        _run_batch_job(job_id, zf, zip_content, image_entries,
+                       target_language, selected_translator,
+                       detection_size, detector, direction)
+    )
+
+    return web.json_response({
+        'job_id': job_id,
+        'status': 'processing',
+        'total_pages': len(image_entries),
+        'done_count': 0,
+        'message': f'Job started. Poll GET /batch-zip-status/{job_id} for progress.'
+    })
+
+
+async def _run_batch_job(job_id, zf, zip_content, image_entries,
+                         target_language, selected_translator,
+                         detection_size, detector, direction):
+    """Background coroutine that translates each page and assembles the output ZIP."""
+    global FORMAT, BATCH_JOBS
+
+    job = BATCH_JOBS[job_id]
+    task_ids = []   # list of (original_name, task_id | None)
     now = time.time()
 
+    # ------------------------------------------------------------------ #
+    # Queue each image — skip pages already translated (smart resume)
+    # ------------------------------------------------------------------ #
     for entry_name in image_entries:
         try:
             img_bytes = zf.read(entry_name)
@@ -350,99 +407,163 @@ async def batch_zip_async(request):
             img.verify()
             img = Image.open(io.BytesIO(img_bytes))
         except Exception as e:
-            print(f'[batch-zip] Skipping {entry_name}: {e}')
-            task_ids.append((entry_name, None))  # mark as failed
+            print(f'[batch-zip:{job_id}] Skipping {entry_name}: {e}')
+            task_ids.append((entry_name, None))
+            job['failed'].append(entry_name)
             continue
 
         if img.width * img.height > MAX_IMAGE_SIZE_PX:
-            print(f'[batch-zip] Skipping {entry_name}: image too large')
+            print(f'[batch-zip:{job_id}] Skipping {entry_name}: image too large')
             task_ids.append((entry_name, None))
+            job['failed'].append(entry_name)
             continue
 
         task_id = f'{phash(img, hash_size=16)}-{detection_size}-{selected_translator}-{target_language}-{detector}-{direction}'
 
-        if not os.path.exists(f'result/{task_id}/final.{FORMAT}'):
-            os.makedirs(f'result/{task_id}/', exist_ok=True)
-            img.save(f'result/{task_id}/input.png')
+        # RESUME: if result already on disk, count as done immediately
+        if os.path.exists(f'result/{task_id}/final.{FORMAT}'):
+            print(f'[batch-zip:{job_id}] Resume: {entry_name} already translated, skipping')
+            task_ids.append((entry_name, task_id))
+            job['done_count'] += 1
+            continue
 
-            if task_id not in TASK_DATA:
-                QUEUE.append(task_id)
-                TASK_DATA[task_id] = {
-                    'detection_size': detection_size,
-                    'translator': selected_translator,
-                    'target_lang': target_language,
-                    'detector': detector,
-                    'direction': direction,
-                    'created_at': now,
-                    'requested_at': now,
-                }
-                TASK_STATES[task_id] = {
-                    'info': 'pending',
-                    'finished': False,
-                }
+        # Otherwise queue for translation
+        os.makedirs(f'result/{task_id}/', exist_ok=True)
+        img.save(f'result/{task_id}/input.png')
+
+        if task_id not in TASK_DATA:
+            QUEUE.append(task_id)
+            TASK_DATA[task_id] = {
+                'detection_size': detection_size,
+                'translator': selected_translator,
+                'target_lang': target_language,
+                'detector': detector,
+                'direction': direction,
+                'created_at': now,
+                'requested_at': now,
+            }
+            TASK_STATES[task_id] = {
+                'info': 'pending',
+                'finished': False,
+            }
 
         task_ids.append((entry_name, task_id))
-        print(f'[batch-zip] Queued task {task_id} for {entry_name}')
+        print(f'[batch-zip:{job_id}] Queued {entry_name}')
 
     # ------------------------------------------------------------------ #
-    # 4. Wait until all queued tasks are finished
+    # Wait for all queued tasks to finish, updating progress as they do
     # ------------------------------------------------------------------ #
-    pending = {task_id for _, task_id in task_ids if task_id is not None}
+    completed_task_ids = {  # task_ids already counted as done (from cache)
+        tid for _, tid in task_ids
+        if tid is not None and os.path.exists(f'result/{tid}/final.{FORMAT}')
+    }
+    pending = {
+        tid for _, tid in task_ids
+        if tid is not None and tid not in completed_task_ids
+    }
 
     while pending:
         await asyncio.sleep(0.5)
-        # Refresh requested_at so the cleanup loop doesn't evict our tasks
+
         for task_id in list(pending):
             if task_id in TASK_DATA:
-                TASK_DATA[task_id]['requested_at'] = time.time()
+                TASK_DATA[task_id]['requested_at'] = time.time()  # heartbeat
 
-        done = set()
+        newly_done = set()
         for task_id in list(pending):
-            if task_id not in TASK_STATES:
-                # task was removed (e.g., error / evicted)
-                done.add(task_id)
-            elif TASK_STATES[task_id].get('finished', False):
-                done.add(task_id)
-        pending -= done
+            finished = (
+                task_id not in TASK_STATES or
+                TASK_STATES.get(task_id, {}).get('finished', False)
+            )
+            if finished:
+                newly_done.add(task_id)
+                job['done_count'] += 1
+                print(f'[batch-zip:{job_id}] Progress: {job["done_count"]}/{job["total"]}')
 
-    print('[batch-zip] All tasks finished, assembling result ZIP')
+        pending -= newly_done
+
+    print(f'[batch-zip:{job_id}] All tasks done, assembling ZIP')
 
     # ------------------------------------------------------------------ #
-    # 5. Build the output ZIP in memory
+    # Assemble output ZIP
     # ------------------------------------------------------------------ #
     out_buffer = io.BytesIO()
-    failed_pages = []
+    failed_pages = list(job['failed'])  # already-failed (invalid/too large)
 
     with zipfile.ZipFile(out_buffer, mode='w', compression=zipfile.ZIP_DEFLATED) as out_zip:
         for original_name, task_id in task_ids:
             if task_id is None:
-                failed_pages.append(original_name)
-                continue
+                continue  # already in failed_pages
 
             result_path = f'result/{task_id}/final.{FORMAT}'
             if os.path.exists(result_path):
-                # Preserve the original filename/folder structure inside the ZIP
                 base_name = os.path.splitext(original_name)[0]
                 out_name = f'{base_name}.{FORMAT}'
                 out_zip.write(result_path, arcname=out_name)
-                print(f'[batch-zip] Added {out_name} to result ZIP')
             else:
                 failed_pages.append(original_name)
-                print(f'[batch-zip] Result missing for {original_name} (task_id={task_id})')
+                print(f'[batch-zip:{job_id}] Result missing for {original_name}')
 
-        # If any pages failed, include a summary text file
         if failed_pages:
             summary = 'The following pages could not be translated:\n' + '\n'.join(failed_pages)
             out_zip.writestr('TRANSLATION_ERRORS.txt', summary)
 
     zip_bytes = out_buffer.getvalue()
-    print(f'[batch-zip] Done. Result ZIP size: {len(zip_bytes)} bytes, failed pages: {len(failed_pages)}')
+    job['result_zip'] = zip_bytes
+    job['status'] = 'done'
+    job['done_count'] = job['total']
+    print(f'[batch-zip:{job_id}] Done. ZIP size={len(zip_bytes)} bytes, failed={len(failed_pages)}')
+
+
+@routes.get("/batch-zip-status/{job_id}")
+async def batch_zip_status(request):
+    """
+    Returns JSON progress for a batch job:
+      { job_id, status, total, done_count, failed_count, percent, download_url }
+    status: "processing" | "done" | "error"
+    """
+    job_id = request.match_info['job_id']
+    if job_id not in BATCH_JOBS:
+        return web.json_response({'status': 'error', 'error': 'Job not found'}, status=404)
+
+    job = BATCH_JOBS[job_id]
+    total = job['total']
+    done = job['done_count']
+    percent = round((done / total * 100) if total > 0 else 0)
+
+    resp = {
+        'job_id': job_id,
+        'status': job['status'],
+        'total': total,
+        'done_count': done,
+        'failed_count': len(job['failed']),
+        'percent': percent,
+    }
+    if job['status'] == 'done':
+        resp['download_url'] = f'/batch-zip-download/{job_id}'
+        resp['output_filename'] = job['output_filename']
+
+    return web.json_response(resp)
+
+
+@routes.get("/batch-zip-download/{job_id}")
+async def batch_zip_download(request):
+    """Downloads the translated ZIP for a completed job."""
+    job_id = request.match_info['job_id']
+    if job_id not in BATCH_JOBS:
+        return web.json_response({'error': 'Job not found'}, status=404)
+
+    job = BATCH_JOBS[job_id]
+    if job['status'] != 'done':
+        return web.json_response(
+            {'error': f'Job not done yet (status: {job["status"]})'}, status=202
+        )
 
     return web.Response(
-        body=zip_bytes,
+        body=job['result_zip'],
         status=200,
         content_type='application/zip',
-        headers={'Content-Disposition': f'attachment; filename="{original_filename}"'},
+        headers={'Content-Disposition': f'attachment; filename="{job["output_filename"]}"'},
     )
 
 
