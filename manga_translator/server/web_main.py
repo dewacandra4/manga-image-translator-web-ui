@@ -384,7 +384,7 @@ async def batch_zip_async(request):
         'done_count': 0,
         'failed': [],
         'output_filename': output_filename,
-        'result_zip': None,
+        'result_zip_path': None,
         'created_at': time.time(),
         'error': None,
         'last_milestone': 0,  # Track milestones (25, 50, 75, 100)
@@ -529,11 +529,15 @@ async def _run_batch_job(job_id, zf, zip_content, image_entries,
             summary = 'The following pages could not be translated:\n' + '\n'.join(failed_pages)
             out_zip.writestr('TRANSLATION_ERRORS.txt', summary)
 
-    zip_bytes = out_buffer.getvalue()
-    job['result_zip'] = zip_bytes
+    os.makedirs('jobs', exist_ok=True)
+    job_zip_path = os.path.join('jobs', f'{job_id}.zip')
+    with open(job_zip_path, 'wb') as f:
+        f.write(out_buffer.getvalue())
+
+    job['result_zip_path'] = job_zip_path
     job['status'] = 'done'
     job['done_count'] = job['total']
-    print(f'[batch-zip:{job_id}] Done. ZIP size={len(zip_bytes)} bytes, failed={len(failed_pages)}')
+    print(f'[batch-zip:{job_id}] Done. ZIP saved to {job_zip_path}, failed={len(failed_pages)}')
 
 
 @routes.get("/batch-zip-status/{job_id}")
@@ -590,10 +594,9 @@ async def batch_zip_download(request):
         )
 
     filename_encoded = quote(job["output_filename"])
-    return web.Response(
-        body=job['result_zip'],
+    return web.FileResponse(
+        path=job['result_zip_path'],
         status=200,
-        content_type='application/zip',
         headers={
             'Content-Disposition': f'attachment; filename="{job["output_filename"]}"; filename*=UTF-8\'\'{filename_encoded}'
         },
@@ -946,6 +949,15 @@ async def dispatch(host: str, port: int, nonce: str = None, translation_params: 
                             pass
 
             for tid in to_del_task_ids:
+                if tid in BATCH_JOBS:
+                    job = BATCH_JOBS[tid]
+                    if job.get('result_zip_path') and os.path.exists(job['result_zip_path']):
+                        try:
+                            print(f'REMOVING JOB ZIP: {job["result_zip_path"]}')
+                            os.remove(job['result_zip_path'])
+                        except Exception as e:
+                            print(f'Failed to remove job zip: {e}')
+                    del BATCH_JOBS[tid]
                 del TASK_STATES[tid]
                 del TASK_DATA[tid]
 
