@@ -15,6 +15,7 @@ from PIL import Image
 from aiohttp import web
 from collections import deque
 from imagehash import phash
+from urllib.parse import quote
 
 SERVER_DIR_PATH = os.path.dirname(os.path.realpath(__file__))
 BASE_PATH = os.path.dirname(os.path.dirname(SERVER_DIR_PATH))
@@ -318,9 +319,28 @@ async def batch_zip_async(request):
         return web.json_response({'status': 'error', 'error': 'No file field in request'})
 
     zip_content = data['file'].file.read()
-    original_filename = data['file'].filename or 'manga.zip'
+    # Debug logging to a file since terminal access is limited
+    with open('batch_zip_debug.log', 'a') as f:
+        f.write(f"\n[{time.ctime()}] New Job Request:\n")
+        f.write(f"  Field keys: {list(data.keys())}\n")
+        if 'file' in data:
+            f.write(f"  data['file'].filename: {data['file'].filename}\n")
+        f.write(f"  data.get('filename'): {data.get('filename')}\n")
+        f.write(f"  data.get('file_name'): {data.get('file_name')}\n")
+
+    # Prioritize explicit filename parameter, then multipart filename, then fallback
+    # Handle empty strings from n8n fields and replace spaces/special chars to avoid header issues
+    f_param = (data.get('filename') or data.get('file_name') or '').strip()
+    if f_param:
+        f_param = f_param.replace(' ', '_').replace(',', '_').replace(';', '_')
+
+    original_filename = f_param or data['file'].filename or 'manga.zip'
     base_stem = os.path.splitext(original_filename)[0]
     output_filename = f'{base_stem}_translated.zip'
+
+    with open('batch_zip_debug.log', 'a') as f:
+        f.write(f"  Final chosen original_filename: {original_filename}\n")
+        f.write(f"  Resulting output_filename: {output_filename}\n")
 
     try:
         zf = zipfile.ZipFile(io.BytesIO(zip_content))
@@ -367,6 +387,7 @@ async def batch_zip_async(request):
         'result_zip': None,
         'created_at': time.time(),
         'error': None,
+        'last_milestone': 0,  # Track milestones (25, 50, 75, 100)
     }
 
     print(f'[batch-zip] New job {job_id}: {len(image_entries)} pages, params={param_str}')
@@ -531,6 +552,14 @@ async def batch_zip_status(request):
     done = job['done_count']
     percent = round((done / total * 100) if total > 0 else 0)
 
+    # Detect milestone crossings (25, 50, 75, 100)
+    milestone_reached = None
+    for m in [100, 75, 50, 25]:
+        if percent >= m > job.get('last_milestone', 0):
+            milestone_reached = m
+            job['last_milestone'] = m
+            break
+
     resp = {
         'job_id': job_id,
         'status': job['status'],
@@ -538,6 +567,7 @@ async def batch_zip_status(request):
         'done_count': done,
         'failed_count': len(job['failed']),
         'percent': percent,
+        'milestone_reached': milestone_reached,
     }
     if job['status'] == 'done':
         resp['download_url'] = f'/batch-zip-download/{job_id}'
@@ -559,11 +589,14 @@ async def batch_zip_download(request):
             {'error': f'Job not done yet (status: {job["status"]})'}, status=202
         )
 
+    filename_encoded = quote(job["output_filename"])
     return web.Response(
         body=job['result_zip'],
         status=200,
         content_type='application/zip',
-        headers={'Content-Disposition': f'attachment; filename="{job["output_filename"]}"'},
+        headers={
+            'Content-Disposition': f'attachment; filename="{job["output_filename"]}"; filename*=UTF-8\'\'{filename_encoded}'
+        },
     )
 
 
