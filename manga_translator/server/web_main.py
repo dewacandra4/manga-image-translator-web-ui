@@ -572,6 +572,7 @@ async def batch_zip_status(request):
     if job['status'] == 'done':
         resp['download_url'] = f'/batch-zip-download/{job_id}'
         resp['output_filename'] = job['output_filename']
+        resp['cbz_download_url'] = f'/batch-cbz-download/{job_id}'
 
     return web.json_response(resp)
 
@@ -596,6 +597,31 @@ async def batch_zip_download(request):
         content_type='application/zip',
         headers={
             'Content-Disposition': f'attachment; filename="{job["output_filename"]}"; filename*=UTF-8\'\'{filename_encoded}'
+        },
+    )
+
+
+@routes.get("/batch-cbz-download/{job_id}")
+async def batch_cbz_download(request):
+    """Same as batch-zip-download but serves as .cbz for mobile comic readers (e.g. Tachiyomi/Mihon)."""
+    job_id = request.match_info['job_id']
+    if job_id not in BATCH_JOBS:
+        return web.json_response({'error': 'Job not found'}, status=404)
+
+    job = BATCH_JOBS[job_id]
+    if job['status'] != 'done':
+        return web.json_response(
+            {'error': f'Job not done yet (status: {job["status"]})'}, status=202
+        )
+
+    cbz_filename = job['output_filename'].replace('.zip', '.cbz')
+    filename_encoded = quote(cbz_filename)
+    return web.Response(
+        body=job['result_zip'],  # same bytes as ZIP, different extension
+        status=200,
+        content_type='application/x-cbz',
+        headers={
+            'Content-Disposition': f'attachment; filename="{cbz_filename}"; filename*=UTF-8\'\'{filename_encoded}'
         },
     )
 
