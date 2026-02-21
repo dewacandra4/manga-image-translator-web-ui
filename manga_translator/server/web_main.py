@@ -619,10 +619,9 @@ async def batch_cbz_download(request):
 
     cbz_filename = job['output_filename'].replace('.zip', '.cbz')
     filename_encoded = quote(cbz_filename)
-    return web.Response(
-        body=job['result_zip'],  # same bytes as ZIP, different extension
+    return web.FileResponse(
+        path=job['result_zip_path'],
         status=200,
-        content_type='application/x-cbz',
         headers={
             'Content-Disposition': f'attachment; filename="{cbz_filename}"; filename*=UTF-8\'\'{filename_encoded}'
         },
