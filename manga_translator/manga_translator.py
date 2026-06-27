@@ -677,6 +677,16 @@ class MangaTranslatorWeb(MangaTranslator):
         self.ignore_errors = params.get('ignore_errors', True)
         self._task_id = None
         self._params = None
+        self.client_id = os.getenv('API_CLIENT_ID')
+        self.client_secret = os.getenv('API_CLIENT_SECRET')
+
+    def _get_auth_headers(self):
+        headers = {}
+        if self.client_id:
+            headers['X-Client-Id'] = self.client_id
+        if self.client_secret:
+            headers['X-Client-Secret'] = self.client_secret
+        return headers
 
     async def _init_connection(self):
         available_translators = []
@@ -694,7 +704,7 @@ class MangaTranslatorWeb(MangaTranslator):
                 'translators': available_translators,
             },
         }
-        requests.post(f'http://{self.host}:{self.port}/connect-internal', json=data)
+        requests.post(f'http://{self.host}:{self.port}/connect-internal', json=data, headers=self._get_auth_headers())
 
     async def _send_state(self, state: str, finished: bool):
         # wait for translation to be saved first (bad solution?)
@@ -707,7 +717,7 @@ class MangaTranslatorWeb(MangaTranslator):
                     'state': state,
                     'finished': finished,
                 }
-                requests.post(f'http://{self.host}:{self.port}/task-update-internal', json=data, timeout=20)
+                requests.post(f'http://{self.host}:{self.port}/task-update-internal', json=data, timeout=20, headers=self._get_auth_headers())
                 break
             except Exception:
                 # if translation is finished server has to know
@@ -719,7 +729,7 @@ class MangaTranslatorWeb(MangaTranslator):
     def _get_task(self):
         try:
             rjson = requests.get(f'http://{self.host}:{self.port}/task-internal?nonce={self.nonce}',
-                                 timeout=3600).json()
+                                 timeout=3600, headers=self._get_auth_headers()).json()
             return rjson.get('task_id'), rjson.get('data')
         except Exception:
             return None, None
@@ -775,7 +785,7 @@ class MangaTranslatorWeb(MangaTranslator):
                 'nonce': self.nonce,
                 'texts': [r.text for r in text_regions],
                 'translations': [r.translation for r in text_regions],
-            }, timeout=20)
+            }, timeout=20, headers=self._get_auth_headers())
 
             # wait for at most 1 hour for manual translation
             wait_until = time.time() + 3600
@@ -783,7 +793,7 @@ class MangaTranslatorWeb(MangaTranslator):
                 ret = requests.post(f'http://{self.host}:{self.port}/get-manual-result-internal', json={
                     'task_id': self._task_id,
                     'nonce': self.nonce
-                }, timeout=20).json()
+                }, timeout=20, headers=self._get_auth_headers()).json()
                 if 'result' in ret:
                     manual_translations = ret['result']
                     if isinstance(manual_translations, str):
@@ -971,11 +981,19 @@ class MangaTranslatorWS(MangaTranslator):
                 logger_conn = logger.getChild('connection')
                 if self.verbose:
                     logger_conn.setLevel(logging.DEBUG)
+                headers = {
+                        'x-secret': self.secret,
+                }
+                client_id = os.getenv('API_CLIENT_ID')
+                client_secret = os.getenv('API_CLIENT_SECRET')
+                if client_id:
+                    headers['X-Client-Id'] = client_id
+                if client_secret:
+                    headers['X-Client-Secret'] = client_secret
+
                 async for websocket in websockets.connect(
                         self.url,
-                        extra_headers={
-                            'x-secret': self.secret,
-                        },
+                        extra_headers=headers,
                         max_size=1_000_000,
                         logger=logger_conn
                 ):
@@ -1090,6 +1108,20 @@ class MangaTranslatorAPI(MangaTranslator):
     def middleware_factory(self):
         @middleware
         async def sample_middleware(request, handler):
+            # Authentication check
+            client_id = request.headers.get('X-Client-Id') or request.headers.get('CF-Access-Client-Id')
+            client_secret = request.headers.get('X-Client-Secret') or request.headers.get('CF-Access-Client-Secret')
+            
+            valid_id = os.getenv('API_CLIENT_ID')
+            valid_secret = os.getenv('API_CLIENT_SECRET')
+            
+            if valid_id and valid_secret:
+                if client_id != valid_id or client_secret != valid_secret:
+                    return web.json_response(
+                        {'error': 'Unauthorized: Invalid or missing API credentials', 'status': 401},
+                        status=401
+                    )
+
             id = self.generate_id()
             self.queue.append(id)
             try:
