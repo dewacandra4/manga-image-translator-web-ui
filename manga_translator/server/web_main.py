@@ -97,6 +97,11 @@ FORMAT = ''
 # Keys: job_id (SHA-256 of ZIP content + params)
 # Values: dict with status, progress, result bytes, etc.
 BATCH_JOBS = {}
+# Remove a finished job (and its output ZIP) this long after completion — well
+# beyond the client's poll + download window.
+BATCH_JOB_REMOVE_TIMEOUT = 1800        # 30 minutes
+# Reap a job stuck in 'processing' (e.g. the worker crashed) after this long.
+BATCH_JOB_STALE_TIMEOUT = 6 * 3600     # 6 hours
 
 @web.middleware
 async def auth_middleware(request, handler):
@@ -427,9 +432,9 @@ async def batch_zip_async(request):
 
     # Start background processing (non-blocking)
     asyncio.ensure_future(
-        _run_batch_job(job_id, zf, zip_content, image_entries,
-                       target_language, selected_translator,
-                       detection_size, detector, direction)
+        _run_batch_job_guarded(job_id, zf, zip_content, image_entries,
+                               target_language, selected_translator,
+                               detection_size, detector, direction)
     )
 
     return web.json_response({
@@ -570,7 +575,48 @@ async def _run_batch_job(job_id, zf, zip_content, image_entries,
     job['result_zip_path'] = job_zip_path
     job['status'] = 'done'
     job['done_count'] = job['total']
+    job['finished_at'] = time.time()
     print(f'[batch-zip:{job_id}] Done. ZIP saved to {job_zip_path}, failed={len(failed_pages)}')
+
+
+async def _run_batch_job_guarded(job_id, *args):
+    """Run _run_batch_job but never let an exception leave the job stuck in
+    'processing' — mark it 'error' so cleanup_batch_jobs can reap it."""
+    try:
+        await _run_batch_job(job_id, *args)
+    except Exception as e:
+        job = BATCH_JOBS.get(job_id)
+        if job is not None:
+            job['status'] = 'error'
+            job['error'] = str(e)
+            job['finished_at'] = time.time()
+        print(f'[batch-zip:{job_id}] Job crashed: {e}')
+
+
+def cleanup_batch_jobs(now):
+    """Free finished/stale batch-zip jobs from memory and disk.
+
+    BATCH_JOBS uses its own id space (job_id = sha256 of the ZIP), separate
+    from the per-page task ids, so it needs its own reaper. Removes done/error
+    jobs older than BATCH_JOB_REMOVE_TIMEOUT and jobs stuck in 'processing'
+    older than BATCH_JOB_STALE_TIMEOUT, deleting the output ZIP along the way.
+    """
+    for job_id in list(BATCH_JOBS.keys()):
+        job = BATCH_JOBS[job_id]
+        if job['status'] in ('done', 'error'):
+            expired = now - job.get('finished_at', job['created_at']) > BATCH_JOB_REMOVE_TIMEOUT
+        else:
+            expired = now - job['created_at'] > BATCH_JOB_STALE_TIMEOUT
+        if not expired:
+            continue
+        path = job.get('result_zip_path')
+        if path and os.path.exists(path):
+            try:
+                os.remove(path)
+            except Exception as e:
+                print(f'[batch-zip] Failed to remove job zip {path}: {e}')
+        del BATCH_JOBS[job_id]
+        print(f'[batch-zip] Cleaned up job {job_id} (status={job["status"]})')
 
 
 @routes.get("/batch-zip-status/{job_id}")
@@ -1007,17 +1053,11 @@ async def dispatch(host: str, port: int, nonce: str = None, translation_params: 
                             pass
 
             for tid in to_del_task_ids:
-                if tid in BATCH_JOBS:
-                    job = BATCH_JOBS[tid]
-                    if job.get('result_zip_path') and os.path.exists(job['result_zip_path']):
-                        try:
-                            print(f'REMOVING JOB ZIP: {job["result_zip_path"]}')
-                            os.remove(job['result_zip_path'])
-                        except Exception as e:
-                            print(f'Failed to remove job zip: {e}')
-                    del BATCH_JOBS[tid]
                 del TASK_STATES[tid]
                 del TASK_DATA[tid]
+
+            # Reap finished/stale batch-zip jobs (separate id space from tasks)
+            cleanup_batch_jobs(now)
 
             # Delete oldest folder if disk space is becoming sparse
             if DISK_SPACE_LIMIT >= 0 and len(FINISHED_TASKS) > 0 and shutil.disk_usage('result/')[2] < DISK_SPACE_LIMIT:

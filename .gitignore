@@ -1,4 +1,6 @@
 result
+jobs
+batch_zip_debug.log
 *.ckpt
 *.pt
 .vscode
