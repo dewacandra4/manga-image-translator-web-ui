@@ -83,7 +83,7 @@ def _build_valid_translators():
 VALID_TRANSLATORS = _build_valid_translators()
 
 
-MAX_ONGOING_TASKS = 1
+MAX_ONGOING_TASKS = 3
 MAX_IMAGE_SIZE_PX = 8000**2
 
 # Time to wait for web client to send a request to /task-state request
