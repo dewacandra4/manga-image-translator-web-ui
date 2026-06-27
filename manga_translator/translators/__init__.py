@@ -7,7 +7,7 @@ from .youdao import YoudaoTranslator
 from .deepl import DeeplTranslator
 from .papago import PapagoTranslator
 from .caiyun import CaiyunTranslator
-from .chatgpt import GPT3Translator, GPT35TurboTranslator, GPT4Translator
+from .chatgpt import GPT3Translator, GPT35TurboTranslator, GPT4Translator, GPT5Translator
 from .nllb import NLLBTranslator, NLLBBigTranslator
 from .sugoi import JparacrawlTranslator, JparacrawlBigTranslator, SugoiTranslator
 from .m2m100 import M2M100Translator, M2M100BigTranslator
@@ -42,6 +42,8 @@ TRANSLATORS = {
     'gpt3': GPT3Translator,
     'gpt3.5': GPT35TurboTranslator,
     'gpt4': GPT4Translator,
+    'gpt5': GPT5Translator,
+    'gpt-5.1': GPT5Translator,
     'none': NoneTranslator,
     'original': OriginalTranslator,
     'sakura': SakuraTranslator,

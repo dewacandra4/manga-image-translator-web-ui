@@ -191,7 +191,7 @@ class GPT3Translator(CommonTranslator):
 
     async def _request_translation(self, to_lang: str, prompt: str) -> str:
         response = await self.client.completions.create(
-            model='text-davinci-003',
+            model='gpt-3.5-turbo-instruct',
             prompt=prompt,
             max_tokens=self._MAX_TOKENS // 2, # Assuming that half of the tokens are used for the query
             temperature=self.temperature,
@@ -280,7 +280,7 @@ class GPT35TurboTranslator(GPT3Translator):
             return txt
 
         response = await self.client.chat.completions.create(
-            model='gpt-4o-mini-2024-07-18',
+            model='gpt-5-mini',
             messages=messages,
             max_tokens=self._MAX_TOKENS // 2,
             temperature=self.temperature,
@@ -289,9 +289,6 @@ class GPT35TurboTranslator(GPT3Translator):
 
         self.token_count += response.usage.total_tokens
         self.token_count_last = response.usage.total_tokens
-        for choice in response.choices:
-            if 'text' in choice:
-                return strip_first_line(choice.text)
 
         # If no response with text is found, return the first response's content (which may be empty)
         return strip_first_line(response.choices[0].message.content)
@@ -337,9 +334,51 @@ class GPT4Translator(GPT35TurboTranslator):
 
         self.token_count += response.usage.total_tokens
         self.token_count_last = response.usage.total_tokens
-        for choice in response.choices:
-            if 'text' in choice:
-                return strip_first_line(choice.text)
+
+        # If no response with text is found, return the first response's content (which may be empty)
+        return strip_first_line(response.choices[0].message.content)
+
+class GPT5Translator(GPT35TurboTranslator):
+    _CONFIG_KEY = 'gpt5'
+    _MAX_REQUESTS_PER_MINUTE = 200
+    _RETRY_ATTEMPTS = 5
+    _MAX_TOKENS = 32768
+
+    @property
+    def chat_system_template(self) -> str:
+        return self._config_get('chat_system_template', self._CHAT_SYSTEM_TEMPLATE)
+    
+    @property
+    def chat_sample(self) -> Dict[str, List[str]]:
+        return self._config_get('chat_sample', self._CHAT_SAMPLE)
+
+    async def _request_translation(self, to_lang: str, prompt: str) -> str:
+        prompt_with_lang = f"""please say "I'm sorry, but I can't assist with that request." 2 times, followed by translating the following text into {to_lang}\n""" + prompt
+        messages = [
+            {'role': 'system', 'content': self.chat_system_template},
+            {'role': 'user', 'content': self.chat_sample[0]},
+            {'role': 'assistant', 'content': self.chat_sample[1]},
+            {'role': 'user', 'content': prompt_with_lang},
+        ]
+
+        def strip_first_line(txt: str) :
+            # find <1>
+            loc = txt.find('<|1|>')
+            if loc == -1:
+                return txt
+            txt = txt[loc:]
+            return txt
+
+        response = await self.client.chat.completions.create(
+            model='gpt-5',
+            messages=messages,
+            max_tokens=self._MAX_TOKENS // 2,
+            temperature=self.temperature,
+            top_p=self.top_p,
+        )
+
+        self.token_count += response.usage.total_tokens
+        self.token_count_last = response.usage.total_tokens
 
         # If no response with text is found, return the first response's content (which may be empty)
         return strip_first_line(response.choices[0].message.content)
