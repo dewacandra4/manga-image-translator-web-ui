@@ -98,7 +98,40 @@ FORMAT = ''
 # Values: dict with status, progress, result bytes, etc.
 BATCH_JOBS = {}
 
-app = web.Application(client_max_size = 1024 * 1024 * 50)  # 50MB limit for manga ZIP uploads
+@web.middleware
+async def auth_middleware(request, handler):
+    """
+    Middleware to validate Client ID and Client Secret from headers.
+    Protects main API endpoints from direct access bypass.
+    """
+    # Protect ALL endpoints as requested
+    is_protected = True
+    
+    if is_protected:
+        # Check for both custom headers and Cloudflare Access headers
+        client_id = request.headers.get('X-Client-Id') or request.headers.get('CF-Access-Client-Id')
+        client_secret = request.headers.get('X-Client-Secret') or request.headers.get('CF-Access-Client-Secret')
+        
+        # Valid credentials from environment variables
+        valid_id = os.getenv('API_CLIENT_ID')
+        valid_secret = os.getenv('API_CLIENT_SECRET')
+        
+        # If security is configured in environment, enforce it
+        if valid_id and valid_secret:
+            if client_id != valid_id or client_secret != valid_secret:
+                print(f'[auth] Blocked unauthorized request to {request.path} from {request.remote}')
+                return web.json_response(
+                    {'status': 'error', 'error': 'Unauthorized: Invalid or missing API credentials'},
+                    status=401
+                )
+        elif not valid_id or not valid_secret:
+            # Optional: Warn if env vars are missing but protection was expected
+            # For now, we allow if not configured to avoid breaking existing setups unless env vars are provided
+            pass
+
+    return await handler(request)
+
+app = web.Application(client_max_size = 1024 * 1024 * 50, middlewares=[auth_middleware])  # 50MB limit for manga ZIP uploads
 routes = web.RouteTableDef()
 
 
