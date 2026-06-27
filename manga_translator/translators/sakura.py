@@ -552,10 +552,6 @@ class SakuraTranslator(CommonTranslator):
             extra_query=extra_query,
         )
         # 提取并返回响应文本
-        for choice in response.choices:
-            if 'text' in choice:
-                return choice.text
-
         return response.choices[0].message.content
 
     def _set_gpt_style(self, style_name: str):
