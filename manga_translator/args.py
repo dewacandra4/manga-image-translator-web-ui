@@ -113,7 +113,7 @@ parser.add_argument('--upscale-ratio', default=None, type=float, help='Image ups
 parser.add_argument('--colorizer', default=None, type=str, choices=COLORIZERS, help='Colorization model to use.')
 
 g = parser.add_mutually_exclusive_group()
-g.add_argument('--translator', default='google', type=str, choices=TRANSLATORS, help='Language translator to use')
+g.add_argument('--translator', default='sugoi', type=str, choices=TRANSLATORS, help='Language translator to use')
 g.add_argument('--translator-chain', default=None, type=translator_chain, help='Output of one translator goes in another. Example: --translator-chain "google:JPN;sugoi:ENG".')
 g.add_argument('--selective-translation', default=None, type=translator_chain, help='Select a translator based on detected language in image. Note the first translation service acts as default if the language isn\'t defined. Example: --translator-chain "google:JPN;sugoi:ENG".')
 

@@ -46,28 +46,42 @@ VALID_LANGUAGES = {
 # Whitelists
 VALID_DETECTORS = set(['default', 'ctd'])
 VALID_DIRECTIONS = set(['auto', 'h', 'v'])
-VALID_TRANSLATORS = [
-    'youdao',
-    'baidu',
-    'google',
-    'deepl',
-    'papago',
-    'caiyun',
-    'gpt3.5',
-    'gpt4',
-    'nllb',
-    'nllb_big',
-    'sugoi',
-    'jparacrawl',
-    'jparacrawl_big',
-    'm2m100',
-    'm2m100_big',
-    'qwen2',
-    'qwen2_big',
-    'sakura',
-    'none',
-    'original',
+
+# Build translator list based on what API keys are actually present.
+# Online translators are only included if their env vars are non-empty;
+# offline translators (sugoi, m2m100, nllb, etc.) are always available.
+ONLINE_TRANSLATORS_CONFIG = [
+    ('youdao', 'YOUDAO_APP_KEY', 'YOUDAO_SECRET_KEY'),
+    ('baidu', 'BAIDU_APP_ID', 'BAIDU_SECRET_KEY'),
+    ('deepl', 'DEEPL_AUTH_KEY'),
+    ('gpt3', 'OPENAI_API_KEY'),
+    ('gpt3.5', 'OPENAI_API_KEY'),
+    ('gpt4', 'OPENAI_API_KEY'),
+    ('gpt5', 'OPENAI_API_KEY'),
+    ('gpt-5.1', 'OPENAI_API_KEY'),
+    ('caiyun', 'CAIYUN_TOKEN'),
 ]
+# Offline translators: always available (no API key required)
+OFFLINE_TRANSLATORS = [
+    'nllb', 'nllb_big', 'sugoi', 'jparacrawl', 'jparacrawl_big',
+    'm2m100', 'm2m100_big', 'mbart50', 'qwen2', 'qwen2_big',
+    'sakura',
+    'none', 'original',
+]
+
+def _build_valid_translators():
+    """Return the translator list considering what API keys are set."""
+    valid = set(OFFLINE_TRANSLATORS)
+    for entry in ONLINE_TRANSLATORS_CONFIG:
+        name = entry[0]
+        # all required env vars must be non-empty to include this translator
+        required_keys = entry[1:]
+        if all(os.getenv(k) for k in required_keys):
+            valid.add(name)
+    return sorted(valid)
+
+VALID_TRANSLATORS = _build_valid_translators()
+
 
 MAX_ONGOING_TASKS = 1
 MAX_IMAGE_SIZE_PX = 8000**2
@@ -194,7 +208,7 @@ async def queue_size_async(request):
 async def handle_post(request):
     data = await request.post()
     detection_size = None
-    selected_translator = 'youdao'
+    selected_translator = 'sugoi'
     target_language = 'CHS'
     detector = 'default'
     direction = 'auto'

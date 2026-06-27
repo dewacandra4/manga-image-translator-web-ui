@@ -697,6 +697,10 @@ class MangaTranslatorWeb(MangaTranslator):
                 available_translators.append(key)
             except MissingAPIKeyException:
                 pass
+            except Exception as e:
+                # Log unexpected errors but continue with other translators
+                # This prevents the app from crashing if a translator has unexpected initialization issues
+                logger.warning(f'Skipping translator "{key}" due to initialization error: {e}')
 
         data = {
             'nonce': self.nonce,
